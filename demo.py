@@ -1,65 +1,126 @@
-"""Generate a sample clip and replay one SQS job against the local stack."""
+"""Manually exercise duplicate deliveries and the worker's commit boundaries."""
 
 import json
 import logging
-from pathlib import Path
-from tempfile import TemporaryDirectory
-from uuid import uuid4
+from contextlib import contextmanager
+from unittest.mock import patch
+from uuid import UUID, uuid4
 
 import psycopg
 
-from media import run
+from local_aws import prepare_local, upload_sample
 from worker import Worker
+
+
+class SimulatedExit(SystemExit):
+    """Leave the message unacknowledged just as a stopped worker would."""
+
+
+def enqueue_sample(worker: Worker) -> tuple[UUID, str]:
+    job_id = uuid4()
+    source_key = f"samples/{job_id}.mp4"
+    upload_sample(worker, source_key)
+    body = json.dumps({"job_id": str(job_id), "source_key": source_key})
+    worker.sqs.send_message(QueueUrl=worker.queue_url, MessageBody=body)
+    return job_id, body
+
+
+def job_rows(worker: Worker, job_id: UUID) -> list[tuple]:
+    with psycopg.connect(worker.database_url) as db:
+        return db.execute(
+            """
+            SELECT shot_index, start_us, end_us, frame_key FROM shots
+            WHERE job_id = %s ORDER BY shot_index
+            """,
+            (job_id,),
+        ).fetchall()
+
+
+def assert_complete(worker: Worker, job_id: UUID) -> list[tuple]:
+    with psycopg.connect(worker.database_url) as db:
+        completed = db.execute(
+            "SELECT 1 FROM completed_jobs WHERE job_id = %s", (job_id,),
+        ).fetchone()
+    assert completed, f"{job_id} has no completion record"
+    rows = job_rows(worker, job_id)
+    assert [row[0] for row in rows] == [0, 1, 2], rows
+    for index, start, end, key in rows:
+        # The 25 fps fixture has cuts at exactly 1s and 2s.
+        assert abs(start - index * 1_000_000) <= 40_000, rows
+        assert abs(end - (index + 1) * 1_000_000) <= 40_000, rows
+        worker.s3.head_object(Bucket=worker.output_bucket, Key=key)
+    return rows
+
+
+def assert_acknowledged(worker: Worker) -> None:
+    names = ["ApproximateNumberOfMessages", "ApproximateNumberOfMessagesNotVisible"]
+    counts = worker.sqs.get_queue_attributes(
+        QueueUrl=worker.queue_url, AttributeNames=names,
+    )["Attributes"]
+    assert all(counts[name] == "0" for name in names), counts
+
+
+@contextmanager
+def received_delivery(worker: Worker):
+    messages = worker.sqs.receive_message(
+        QueueUrl=worker.queue_url, MaxNumberOfMessages=1, WaitTimeSeconds=2,
+    )["Messages"]
+    with patch.object(worker.sqs, "receive_message", return_value={"Messages": messages}):
+        yield messages[0]["ReceiptHandle"]
+
+
+def simulate_exit(worker: Worker, target: object, method: str) -> str:
+    with received_delivery(worker) as receipt:
+        with patch.object(target, method, side_effect=SimulatedExit(method)):
+            try:
+                worker.run_once()
+            except SimulatedExit:
+                return receipt
+    raise AssertionError(f"Expected worker to exit at {method}")
+
+
+def make_visible(worker: Worker, receipt: str) -> None:
+    # Advance the test without sleeping for the visibility timeout.
+    worker.sqs.change_message_visibility(
+        QueueUrl=worker.queue_url, ReceiptHandle=receipt, VisibilityTimeout=0,
+    )
 
 
 def main() -> None:
     worker = Worker()
-    for bucket in (worker.input_bucket, worker.output_bucket):
-        worker.s3.create_bucket(Bucket=bucket)
-    worker.queue_url = worker.sqs.create_queue(
-        QueueName="shot-detection", Attributes={"VisibilityTimeout": "300"},
-    )["QueueUrl"]
+    worker.queue_url = prepare_local(worker, f"shot-demo-{uuid4()}")
 
-    job_id = uuid4()
-    source_key = f"{job_id}.mp4"
-    with TemporaryDirectory() as tmp:
-        sample = Path(tmp) / "fixture.mp4"
-        run(
-            "ffmpeg", "-nostdin", "-v", "error",
-            "-f", "lavfi", "-i", "color=black:s=160x120:r=25:d=1",
-            "-f", "lavfi", "-i", "color=white:s=160x120:r=25:d=1",
-            "-f", "lavfi", "-i", "color=black:s=160x120:r=25:d=1",
-            "-filter_complex", "[0:v][1:v][2:v]concat=n=3:v=1:a=0",
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", str(sample),
-        )
-        worker.s3.upload_file(str(sample), worker.input_bucket, source_key)
+    job, body = enqueue_sample(worker)
+    worker.run_once(wait_seconds=2)
+    expected = assert_complete(worker, job)
+    assert_acknowledged(worker)
+    worker.sqs.send_message(QueueUrl=worker.queue_url, MessageBody=body)
+    worker.run_once(wait_seconds=2)
+    assert assert_complete(worker, job) == expected
+    assert_acknowledged(worker)
+    print("PASS: duplicate deliveries leave one set of three shots")
 
-    body = json.dumps({"job_id": str(job_id), "source_key": source_key})
-    for _ in range(2):
-        worker.sqs.send_message(QueueUrl=worker.queue_url, MessageBody=body)
-        worker.run_once(wait_seconds=2)
-        pending = worker.sqs.get_queue_attributes(
-            QueueUrl=worker.queue_url,
-            AttributeNames=["ApproximateNumberOfMessagesNotVisible"],
-        )["Attributes"]
-        assert pending["ApproximateNumberOfMessagesNotVisible"] == "0", pending
-        with psycopg.connect(worker.database_url) as db:
-            rows = db.execute(
-                """
-                SELECT shot_index, start_us, end_us, frame_key FROM shots
-                WHERE job_id = %s ORDER BY shot_index
-                """,
-                (job_id,),
-            ).fetchall()
-        assert len(rows) == 3, rows
-        for index, start, end, key in rows:
-            assert abs(start - index * 1_000_000) <= 40_000, rows
-            assert abs(end - (index + 1) * 1_000_000) <= 40_000, rows
-            worker.s3.head_object(Bucket=worker.output_bucket, Key=key)
+    job, _ = enqueue_sample(worker)
+    receipt = simulate_exit(worker, worker, "save_results")
+    assert job_rows(worker, job) == []
+    with psycopg.connect(worker.database_url) as db:
+        assert db.execute(
+            "SELECT 1 FROM completed_jobs WHERE job_id = %s", (job,),
+        ).fetchone() is None
+    make_visible(worker, receipt)
+    worker.run_once(wait_seconds=2)
+    assert_complete(worker, job)
+    assert_acknowledged(worker)
+    print("PASS: delivery retried after exit before PostgreSQL commit")
 
-    print(f"{job_id}: three shots recorded after replay")
-    for index, start, end, key in rows:
-        print(f"Shot {index + 1}  {start / 1e6:.2f}–{end / 1e6:.2f}s  {key}")
+    job, _ = enqueue_sample(worker)
+    receipt = simulate_exit(worker, worker.sqs, "delete_message")
+    expected = assert_complete(worker, job)
+    make_visible(worker, receipt)
+    worker.run_once(wait_seconds=2)
+    assert assert_complete(worker, job) == expected
+    assert_acknowledged(worker)
+    print("PASS: delivery acknowledged after exit following PostgreSQL commit")
 
 
 if __name__ == "__main__":

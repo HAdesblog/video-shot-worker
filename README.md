@@ -1,29 +1,45 @@
 # Video Shot Worker
 
-A small Python backend that takes a video job from SQS, detects hard cuts with FFmpeg, uploads a representative JPEG for each shot to S3, and stores ordered shot metadata in PostgreSQL.
+A Python backend that takes an SQS job, downloads a video from S3, detects hard cuts with FFmpeg, and saves each shot's time range and preview image location in PostgreSQL.
 
-## Run the local demo
+## Submit a clip and fetch its shots
 
-From the repository root, with Docker and Docker Compose installed:
+Start the local services with Docker Compose. Moto supplies the S3 and SQS APIs locally.
+
+    docker compose run --rm -T worker python local_aws.py --upload-sample > /tmp/shot-job.json
+    docker compose up -d api worker
+
+The setup command uploads a generated MP4 and writes a job UUID and source key to /tmp/shot-job.json. Use the same JSON body to retry submission.
+
+    curl --fail-with-body -sS \
+      -H 'Content-Type: application/json' \
+      --data-binary @/tmp/shot-job.json \
+      http://localhost:8008/jobs
+
+    job_id=$(python3 -c 'import json; print(json.load(open("/tmp/shot-job.json"))["job_id"])')
+    curl --fail-with-body -sS "http://localhost:8008/jobs/$job_id"
+
+Repeat the GET until the sample reaches completed. The response includes three shot time ranges in microseconds and the corresponding JPEG keys. Interactive API documentation is available at http://localhost:8008/docs.
+
+| Route | Behavior |
+| --- | --- |
+| POST /jobs | Accepts a client-generated job UUID and an existing object key. Creates one logical job, even if the client retries the request. Reusing the UUID for a different key returns 409. |
+| GET /jobs/{job_id} | Returns pending, queued, or completed status. Completed jobs include ordered shot rows. Workers can also process raw SQS messages with the same JSON contract. |
+
+## Exercise failure recovery locally
 
     docker compose run --rm worker python demo.py
 
-The demo brings up PostgreSQL and Moto, a local S3/SQS emulator. It generates a three-second clip with hard cuts at one and two seconds, uploads the clip, and sends the same job twice. Its assertions check for exactly three ordered shots, boundaries within one frame of the expected timestamps, an S3 image for each shot, and acknowledgement after each delivery.
+The fixture changes from black to white at 1 second and back to black at 2 seconds. The script checks for exactly three ordered shots with boundaries within one frame of the expected timestamps and a JPEG in S3 for each shot.
 
-## How a job works
+- Deliver the same job twice and compare the saved results.
+- Simulate a worker exit before writing its PostgreSQL results. Make the unacknowledged SQS delivery visible again and verify the retry completes the job.
+- Simulate a worker exit after PostgreSQL commits but before SQS acknowledgement. Redeliver the same message and verify the shot rows stay identical and the message is acknowledged.
 
-1. Upload a video to the input bucket and send an SQS message with a stable job UUID and the object's key.
-2. The worker downloads the video, uses FFmpeg's scene score to detect cuts, and uploads one JPEG per shot at a deterministic key.
-3. The worker commits the completion record and all shot rows in one PostgreSQL transaction, then deletes the SQS message. The job ID is unique, so a redelivered message cannot create a second set of rows.
+## Delivery and persistence
 
-Example message:
+The API reserves the job UUID in PostgreSQL before sending an SQS message. If the queue request fails or its response is lost, repeat the POST with the same UUID and key. The worker commits the completion record and all shot rows in one transaction, then acknowledges the message. The completion record is unique per UUID. Preview JPEGs use deterministic keys, so repeating work for the same job replaces the same objects. Keep the source object immutable for the life of a job.
 
-    {"job_id":"191d3a83-85ec-4c77-a835-9324bbe54287","source_key":"uploads/clip.mp4"}
+To use AWS, provision the input and output buckets and the SQS queue. Apply schema.sql to PostgreSQL, including when upgrading an existing database from the worker-only version. Provide DATABASE_URL, QUEUE_URL, INPUT_BUCKET, and OUTPUT_BUCKET and use the standard AWS SDK credentials and region configuration. Start python worker.py and uvicorn api:app separately. Set a visibility timeout appropriate to your job duration and configure a dead-letter queue for repeated failures.
 
-Each shot stores its zero-based order, start and end times in microseconds, and frame object key. Treat the source object as immutable for a given job ID.
-
-## Run the worker against AWS
-
-Provision the input and frame buckets and an SQS queue in the desired AWS region. Apply [schema.sql](schema.sql) to PostgreSQL. Configure the AWS region and credentials through the standard SDK provider chain, set DATABASE_URL, QUEUE_URL, INPUT_BUCKET, and OUTPUT_BUCKET, and run python worker.py with FFmpeg and FFprobe installed. Omit AWS_ENDPOINT_URL when using AWS.
-
-This demo focuses on short clips and hard cuts. For longer jobs, configure a suitable SQS visibility timeout or renew it during processing. Configure a dead-letter queue in AWS to isolate jobs that repeatedly fail.
+The API is a single-tenant demo that binds to localhost in Docker Compose. Add authentication and tenant-scoped object access before exposing it on a shared network.

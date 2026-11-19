@@ -1,3 +1,20 @@
+x-app: &app
+  build: .
+  environment:
+    AWS_ACCESS_KEY_ID: local-demo
+    AWS_SECRET_ACCESS_KEY: local-demo
+    AWS_DEFAULT_REGION: us-east-1
+    AWS_ENDPOINT_URL: http://aws:5000
+    DATABASE_URL: postgresql://shots:local-demo@db/shots
+    INPUT_BUCKET: shot-worker-input
+    OUTPUT_BUCKET: shot-worker-frames
+    QUEUE_URL: http://aws:5000/123456789012/shot-detection
+  depends_on:
+    db:
+      condition: service_healthy
+    aws:
+      condition: service_healthy
+
 services:
   db:
     image: postgres:17-alpine
@@ -22,18 +39,10 @@ services:
       retries: 20
 
   worker:
-    build: .
-    environment:
-      AWS_ACCESS_KEY_ID: local-demo
-      AWS_SECRET_ACCESS_KEY: local-demo
-      AWS_DEFAULT_REGION: us-east-1
-      AWS_ENDPOINT_URL: http://aws:5000
-      DATABASE_URL: postgresql://shots:local-demo@db/shots
-      INPUT_BUCKET: shot-worker-input
-      OUTPUT_BUCKET: shot-worker-frames
-      QUEUE_URL: http://aws:5000/123456789012/shot-detection
-    depends_on:
-      db:
-        condition: service_healthy
-      aws:
-        condition: service_healthy
+    <<: *app
+
+  api:
+    <<: *app
+    command: ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "127.0.0.1:8008:8000"

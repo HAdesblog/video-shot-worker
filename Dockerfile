@@ -4,5 +4,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY media.py worker.py demo.py ./
+COPY api.py demo.py local_aws.py media.py worker.py ./
 CMD ["python", "worker.py"]
