@@ -1,0 +1,39 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: shots
+      POSTGRES_PASSWORD: local-demo
+      POSTGRES_DB: shots
+    volumes:
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "shots", "-d", "shots"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  aws:
+    image: motoserver/moto:5.1.16
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 5000), 2).close()"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  worker:
+    build: .
+    environment:
+      AWS_ACCESS_KEY_ID: local-demo
+      AWS_SECRET_ACCESS_KEY: local-demo
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ENDPOINT_URL: http://aws:5000
+      DATABASE_URL: postgresql://shots:local-demo@db/shots
+      INPUT_BUCKET: shot-worker-input
+      OUTPUT_BUCKET: shot-worker-frames
+      QUEUE_URL: http://aws:5000/123456789012/shot-detection
+    depends_on:
+      db:
+        condition: service_healthy
+      aws:
+        condition: service_healthy
